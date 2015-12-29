@@ -3,7 +3,6 @@ import collections
 import sys
 
 from util import populate_args
-from serialization import get_encoder
 
 DEFAULT_ROOT = None
 DEFAULT_COMMIT_METHOD_NAME = '_commit'
@@ -29,6 +28,29 @@ class ResourceMethodFailedError(Exception):
     pass
 
 class API(object):
+    """Defines an API to which resource classes are attached.
+
+    Decorators:
+        resource: A decorator to add a class to this API as a named resource
+
+    Methods:
+        create: Creates a new resource instance
+
+        read: Reads from resource instance methods
+
+        update: Calls update/mutation methods on a resource instance
+
+        delete: Calls the delete method on a resource instance
+
+        lookup: Reads from resource class methods (static methods)
+
+        execute: Performs updates/mutations by calling class methods (static methods)
+
+    Helpers:
+        encode: Transforms an object into a serializable form, encoding any embedded resource
+                classes using the access restrictions requied by a given environment
+    """
+
     def __init__(
         self,
         module_root=None,
@@ -39,6 +61,27 @@ class API(object):
         access_level_method_name=DEFAULT_ACCESS_LEVEL_METHOD_NAME,
         permission_order=DEFAULT_PERMISSION_ORDER
     ):
+        """Create and configure a new API to which resource classes can be attached.
+
+        The format of the decorated resource class is configured through the constructor's args.
+
+        Args:
+            module_root (str): The module path prefix to omit from default resource names
+                (if names are not provided and default module paths are used)
+            commit_method_name (str): The name of the commit method in the attached resource classes
+            access_method_name (str): The name of the method used to determine access permissions for
+                resource instances, for a given permission level and environment
+            class_access_method_name (str): The name of the method used to determine access permissions
+                for class methods (static methods), for a given permission level and environment
+            serialization_method_name (str): The name of the method used to transform resource classes
+                into a serializable object, given a particular access permission level
+            access_level_method_name (str): The name of the method used to determine the most restrictive
+                access permission for a given environment and resource class
+            permission_order (List[str]): The order in which to evaluate permissions, if no access level
+                method is defined on a resource class
+
+        """
+
         self.module_root = module_root
         self.commit_method_name = commit_method_name
         self.access_method_name = access_method_name
@@ -54,15 +97,16 @@ class API(object):
         self.is_transactional = {}
 
     def resource(self, cls=None, name=None, is_transactional=True):
-        # configurable decorator to apply to resource classes, to add them to this API
+        """Configurable decorator to apply to resource classes, to add them to this API"""
+
         if cls is None:
             return functools.partial(self.resource, name=name, is_transactional=is_transactional)
 
         if name is None:
             if self.module_root is not None:
-                name = re.sub(r'^' + self.module_root, '', cls.__module__)
+                name = re.sub(r'^' + self.module_root, '', cls.__module__) + '.' + cls.__name__
             else:
-                name = cls.__module__
+                name = cls.__module__ + '.' + cls.__name__
 
         cls._IS_RESOURCE = True
 
@@ -72,10 +116,7 @@ class API(object):
         return cls
 
     def _access_level(self, resource_instance, environment):
-        """
-            Determine the most restrictive access permission
-            a resource instance can provide given an environment
-        """
+        """Determine a resource's most restrictive access permission for a given environment"""
 
         # determine if the resource instance has a method to provide the 
         # highest level of access this environment can give
@@ -99,6 +140,7 @@ class API(object):
         return access_level
 
     def encode(self, obj, environment):
+        """Encodes an object into a serializable view, based on the environment's access level"""
         def _encode(inner_obj):
             encoded = inner_obj
 
@@ -132,7 +174,8 @@ class API(object):
         return _encode(obj)
 
     def _get_resource(self, name):
-        # look up the resource class
+        """Look up a resource class by name"""
+
         resource_class = self.resource_classes.get(name, None)
         if resource_class is None:
             raise ResourceNotFoundError("'" + name + "' is not defined as an identifiable resource")
@@ -140,6 +183,10 @@ class API(object):
         return resource_class
 
     def _call(self, class_obj, parent, methods, access_method_name, environment, allowed_method_types=None, encode=True):
+        """Performs access and permission checking, calls each specified method 
+        (its arguments are combined with the provided environment).
+        """
+
         # look up the access method to check for access
         access_method = getattr(parent, access_method_name, None)
         if access_method is None:
@@ -245,10 +292,7 @@ class API(object):
 
         return commit_result
 
-
-    # Public Interface
-
-    def class_call(self, name, methods, environment, allowed_method_types=('lookup', 'execute'), encode=True):
+    def _class_call(self, name, methods, environment, allowed_method_types=('lookup', 'execute'), encode=True):
         resource_class = self._get_resource(name)
 
         # call the class (static) method and encode the result
@@ -262,13 +306,21 @@ class API(object):
             encode
         )
 
-    def lookup(self, name, methods, environment, allowed_method_types=('lookup',), encode=True):
-        return self.class_call(name, methods, environment, allowed_method_types=allowed_method_types, encode=encode)
+    # Public Interface
 
-    def execute(self, name, methods, environment, allowed_method_types=('execute'), encode=True):
-        return self.class_call(name, methods, environment, allowed_method_types=allowed_method_types, encode=encode)
+    def lookup(self, name, methods, environment, allowed_method_types=('lookup',), encode=True):
+        """Performs a read operation by calling class/static methods on a named resource."""
+
+        return self._class_call(name, methods, environment, allowed_method_types=allowed_method_types, encode=encode)
+
+    def execute(self, name, methods, environment, allowed_method_types=('execute',), encode=True):
+        """Performs an update/mutation operation by calling class/static methods on a named resource."""
+
+        return self._class_call(name, methods, environment, allowed_method_types=allowed_method_types, encode=encode)
     
     def create(self, name, create_method_name, creation_args, methods, environment, allowed_method_types=('read', 'update', 'create'), encode=True):
+        """Creates an instance of a named resource, with methods to call on the created instance."""
+
         resource_class = self._get_resource(name)
         create_methods = [{
             'method': create_method_name, 
@@ -309,6 +361,8 @@ class API(object):
         }
 
     def read(self, name, methods, instance_args, environment, allowed_method_types=('read',), encode=True):
+        """Performs a read operation by calling methods on an instance of a named resource."""
+
         resource_class = self._get_resource(name)
 
         # call the instance method and encode the result
@@ -325,6 +379,8 @@ class API(object):
         return result
 
     def update(self, name, methods, instance_args, environment, allowed_method_types=('read', 'update', 'delete'), encode=True):
+        """Performs an update/mutation operation by calling methods on an instance of a named resource."""
+
         resource_class = self._get_resource(name)
 
         instance = resource_class(**instance_args)
@@ -346,9 +402,8 @@ class API(object):
         }
 
     def delete(self, name, method, instance_args, environment, allowed_method_types=('delete',), encode=True):
+        """Performs a delete operation by calling an instance method of a named resource."""
+
         result = self.update(name, [method], instance_args, environment, allowed_method_types=allowed_method_types, encode=encode)
         result['result'] = result['result'][0]
         return result
-
-
-resource = API().resource

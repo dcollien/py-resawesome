@@ -45,7 +45,7 @@ def get_encoder(wrap_types=False):
     return encode_default
 
 def json_decode(obj):
-    return obj
+    return obj # TODO
 
 def _convert_datetime(value):
     try:
@@ -98,7 +98,7 @@ def convert_arg(type_name, value):
                 value = value
         elif converter is not None:
             if isinstance(converter, type) and isinstance(value, converter):
-                # Converter is a type constructor (class or python type) and
+                # Converter is a type constructor (class, function, or python type) and
                 # value is already an instance of this type
                 pass
             else:

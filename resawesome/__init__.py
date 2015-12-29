@@ -1,5 +1,5 @@
 from decorators import create, read, update, delete, lookup, execute
-from resource import resource, API
+from resource import API
 
 class ResourceNotImplementedError(NotImplementedError):
     pass
@@ -22,3 +22,5 @@ class Resource(object):
 
     def _serialize(_user_id, permission):
         return {}
+
+api = API()
