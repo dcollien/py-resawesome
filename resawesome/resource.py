@@ -1,5 +1,6 @@
 import functools
 import collections
+import sys
 
 from util import populate_args
 from serialization import get_encoder
@@ -24,6 +25,9 @@ class ResourceAccessDeniedError(Exception):
 class ResourceNotAllowedError(Exception):
     pass
 
+class ResourceMethodFailedError(Exception):
+    pass
+
 class API(object):
     def __init__(
         self,
@@ -42,54 +46,59 @@ class API(object):
         self.serialization_method_name = serialization_method_name
         self.permission_order = permission_order
 
-        self.method_names = [commit_method_name, access_method_name, class_access_method_name, serialization_method_name]
+        self.method_names = set([commit_method_name, access_method_name, class_access_method_name, serialization_method_name])
 
-        self.exports = {}
-        self.locations = {}
+        # name -> class lookup for each resource
+        self.resource_classes = {}
+        # name -> bool lookup, determines if a resource is transactional        
         self.is_transactional = {}
 
-    def resource(self, cls, export_name=None, is_transactional=True, location=None):
+    def resource(self, cls=None, name=None, is_transactional=True):
         # configurable decorator to apply to resource classes, to add them to this API
         if cls is None:
-            return functools.partial(self.resource, export_name=export_name, is_transactional=is_transactional, location=location)
+            return functools.partial(self.resource, name=name, is_transactional=is_transactional)
 
-        if location is None:
+        if name is None:
             if self.module_root is not None:
-                module_location = re.sub(r'^' + self.module_root, '', cls.__module__)
-            elif :
-                module_location = cls.__module__
+                name = re.sub(r'^' + self.module_root, '', cls.__module__)
+            else:
+                name = cls.__module__
 
         cls._IS_RESOURCE = True
 
-        self.exports[export_name] = cls
-        self.locations[module_location] = cls
-        self.is_transactional[export_name] = is_transactional
+        self.resource_classes[name] = cls
+        self.is_transactional[name] = is_transactional
 
         return cls
 
-    def _access_level(self, obj, env_arguments):
-        # determine if the object has a method to provide the 
+    def _access_level(self, resource_instance, environment):
+        """
+            Determine the most restrictive access permission
+            a resource instance can provide given an environment
+        """
+
+        # determine if the resource instance has a method to provide the 
         # highest level of access this environment can give
-        access_level_method = getattr(obj, self.access_level_method_name, None)
+        access_level_method = getattr(resource_instance, self.access_level_method_name, None)
         if access_level_method is not None:
-            access_level_kwargs = populate_args(access_level_method, env_arguments)
+            access_level_kwargs = populate_args(access_level_method, environment)
             access_level = access_level_method(**access_level_kwargs)
         else:
             # fall back on calling its access method in the provided
             # permissions order
-            access_method = getattr(obj, self.access_method_name, None)
+            access_method = getattr(resource_instance, self.access_method_name, None)
             access_level = None
 
             if access_method is not None:
                 for permission in self.permission_order:
-                    access_kwargs = populate_args(access_method, {'permission': permission}, env_arguments)
+                    access_kwargs = populate_args(access_method, {'permission': permission}, environment)
                     if access_method(**access_kwargs):
                         access_method = permission
                         break
 
         return access_level
 
-    def encode(self, obj, env_arguments):
+    def encode(self, obj, environment):
         def _encode(inner_obj):
             encoded = inner_obj
 
@@ -97,13 +106,13 @@ class API(object):
             # according to the highest level of access which the environment arguments allow
             if getattr(inner_obj, '_IS_RESOURCE', False):
                 # determine the access level in this environment
-                permission = self._access_level(obj, env_arguments)
+                permission = self._access_level(obj, environment)
                 # retrieve the serializer
                 serializer = getattr(inner_obj, self.serialization_method_name, None)
                 
                 if serializer is not None:
                     # encode the resource using its serializer with the provided permission
-                    serializer_kwargs = populate_args(serializer, {'permission': permission}, env_arguments)
+                    serializer_kwargs = populate_args(serializer, {'permission': permission}, environment)
                     encoded = serializer(**serializer_kwargs)
                 else:
                     raise ValueError("Unable to serialize: object '" + obj.__name__ + "' has no method '" + self.serialization_method_name + "'")
@@ -122,29 +131,29 @@ class API(object):
 
         return _encode(obj)
 
-    def _get_resource(self, export_name):
+    def _get_resource(self, name):
         # look up the resource class
-        resource_class = self.exports.get(export_name, None)
+        resource_class = self.resource_classes.get(name, None)
         if resource_class is None:
-            raise ResourceNotFoundError("'" + export_name + "' is not defined as an exported resource")
+            raise ResourceNotFoundError("'" + name + "' is not defined as an identifiable resource")
 
         return resource_class
 
-    def _call(self, class_name, parent, methods, access_method_name, env_arguments, allowed_method_types, encode=True):
+    def _call(self, class_obj, parent, methods, access_method_name, environment, allowed_method_types=None, encode=True):
         # look up the access method to check for access
         access_method = getattr(parent, access_method_name, None)
         if access_method is None:
-            raise ResourceMethodNotFoundError("'" + class_name + "' is missing an access method")
+            raise ResourceMethodNotFoundError("'" + class_obj.__name__ + "' is missing an access method")
 
-        # check if this is an acceptable method of execution
-        if method._method_type not in allowed_method_types:
-            raise ResourceNotAllowedError("'" + class_name + "' is not allowed to access '" + method_name + "' in this manner")
+        # check if this is an acceptable method of execution as per allowed_method_types
+        if allowed_method_types is not None and method._method_type not in allowed_method_types:
+            raise ResourceNotAllowedError("'" + class_obj.__name__ + "' is not allowed to access '" + method_name + "' in this manner")
 
         # check that access can be granted to call this method
         permission = method._permission
-        access_kwargs = populate_args(access_method, {'permission': permission}, env_arguments)
+        access_kwargs = populate_args(access_method, {'permission': permission}, environment)
         if not access_method(**access_kwargs):
-            raise ResourceAccessDeniedError("'" + class_name + "' has denied access to '" + method_name + "'")
+            raise ResourceAccessDeniedError("'" + class_obj.__name__ + "' has denied access to '" + method_name + "'")
 
         result = []
 
@@ -159,91 +168,120 @@ class API(object):
             method_name = method_name.lower()
 
             if method_name in self.method_names:
-                raise ResourceMethodNotFoundError("'" + class_name + "' cannot export method '" + method_name + "'")
+                err = ResourceMethodNotFoundError("'" + class_obj.__name__ + "' cannot export method '" + method_name + "'")
+                err.method = method_name
+                err.args = sent_arguments
+                raise err
             
-            # lookup the method and ensure it is exported
-            method = getattr(parent, method_name, None)
-            if method is None or not callable(method) or not getattr(method, '_is_exported', False):
-                raise ResourceMethodNotFoundError("'" + class_name + "' has no exported method '" + method_name + "'")
+            class_method = getattr(class_obj, method_name, None)
+            if isinstance(class_method, property):
+                # this "method" is a decorated property
+                num_args = len(sent_arguments)
 
-            method_kwargs = populate_args(method, sent_arguments, env_arguments)
-            result.append(method(**method_kwargs))
+
+                try:
+                    if num_args == 0:
+                        result.append(getattr(parent, method_name))
+                    elif method_name in sent_arguments:
+                        value = sent_arguments[method_name]
+                        setattr(parent, method_name, value)
+                        result.append(value)
+                except Exception as original_err:
+                    # pass on the error information
+                    trace = sys.exc_info()[2]
+                    err = ResourceMethodFailedError("'" + class_obj.__name__ + "' failed to execute '" + method_name + "'")
+                    err.method = method_name
+                    err.args = sent_arguments
+                    err.error = original_err
+                    err.trace = trace
+                    raise err, None, trace
+
+            elif callable(class_method):
+                # this is a callable method
+                # lookup the method and ensure it is exported
+                method = getattr(parent, method_name, None)
+                if method is None or not getattr(method, '_is_exported', False):
+                    err = ResourceMethodNotFoundError("'" + class_obj.__name__ + "' has no exported method '" + method_name + "'")
+                    err.method = method_name
+                    err.args = sent_arguments
+                    raise err
+
+                method_kwargs = populate_args(method, sent_arguments, environment)
+                
+                try:
+                    call_result = method(**method_kwargs)
+                except Exception as original_err:
+                    # pass on the error information
+                    trace = sys.exc_info()[2]
+                    err = ResourceMethodFailedError("'" + class_obj.__name__ + "' failed to execute '" + method_name + "'")
+                    err.method = method_name
+                    err.args = sent_arguments
+                    err.error = original_err
+                    err.trace = trace
+                    raise err, None, trace
+
+                result.append(call_result)
+            else:
+                err = ResourceMethodNotFoundError("'" + class_obj.__name__ + "' has no method or decorated property '" + method_name + "'")
+                err.method = method_name
+                err.args = sent_arguments
+                raise err
 
         if encode:
-            result = self.encode(result, env_arguments)
+            result = self.encode(result, environment)
 
         return result
 
-    def class_call(self, export_name, methods, env_arguments, allowed_method_types=('create', 'lookup', 'execute'), encode=True):
-        resource_class = self._get_resource(export_name)
+    def _commit(self, name, instance, environment, encode=True):
+        commit_result = None
+        # commit changes to the resource
+        if self.is_transactional.get(name, True):
+            commit_method = getattr(instance, self.commit_method_name, None)
+            if commit_method is not None:
+                commit_kwargs = populate_args(commit_method, environment)
+                commit_result = commit_result(**commit_kwargs)
+                if encode:
+                    commit_result = self.encode(commit_result, environment)
+
+        return commit_result
+
+
+    # Public Interface
+
+    def class_call(self, name, methods, environment, allowed_method_types=('lookup', 'execute'), encode=True):
+        resource_class = self._get_resource(name)
 
         # call the class (static) method and encode the result
         return self._call(
-            resource_class.__name__,
+            resource_class,
             resource_class,
             methods,
             self.class_access_method_name,
-            env_arguments,
+            environment,
             allowed_method_types,
             encode
         )
 
-    def instance_read(self, export_name, methods, instance_args, env_arguments, allowed_method_types=('read',), encode=True):
-        resource_class = self._get_resource(export_name)
+    def lookup(self, name, methods, environment, allowed_method_types=('lookup',), encode=True):
+        return self.class_call(name, methods, environment, allowed_method_types=allowed_method_types, encode=encode)
 
-        # call the instance method and encode the result
-        result = self._call(
-            resource_class.__name__,
-            resource_class(**instance_args), # instantiate the resource
-            methods,
-            self.access_method_name,
-            env_arguments,
-            allowed_method_types,
-            encode
-        )
+    def execute(self, name, methods, environment, allowed_method_types=('execute'), encode=True):
+        return self.class_call(name, methods, environment, allowed_method_types=allowed_method_types, encode=encode)
+    
+    def create(self, name, create_method_name, creation_args, methods, environment, allowed_method_types=('read', 'update', 'create'), encode=True):
+        resource_class = self._get_resource(name)
+        create_methods = [{
+            'method': create_method_name, 
+            'args': creation_args
+        }]
 
-        return result
-
-    def instance_write(self, export_name, methods, instance_args, env_arguments, allowed_method_types=('read', 'update', 'delete'), encode=True):
-        resource_class = self._get_resource(export_name)
-
-        # call the instance method and encode the result
-        try:
-            result = self._call(
-                resource_class.__name__,
-                resource_class(**instance_args), # instantiate the resource
-                methods,
-                self.access_method_name,
-                env_arguments,
-                allowed_method_types,
-                encode=encode
-            )
-        except Exception as err:
-            # pass on any exceptions raised
-            raise err
-        else:
-            commit = None
-            # commit changes to the resource
-            if self.is_transactional.get('export_name', True):
-                commit_method = getattr(instance, self.commit_method_name, None)
-                if commit_method is not None:
-                    commit_kwargs = populate_args(commit_method, env_arguments)
-                    commit = self._encode(commit_method(**commit_kwargs), env_arguments)
-                    
-        return {
-            'result': result,
-            'commit': commit
-        }
-
-    def create_call(self, export_name, create_method_name, creation_args, methods, env_arguments, allowed_method_types=('read', 'update', 'create'), encode=True):
-        resource_class = self._get_resource(export_name)
-
-        instance = self.class_call(
-            export_name, {
-                'method': create_method_name, 
-                'args': creation_args
-            },
-            env_arguments,
+        # create an instance
+        instance = self._call(
+            resource_class,
+            resource_class,
+            create_methods,
+            self.class_access_method_name,
+            environment,
             allowed_method_types=('create',),
             encode=False
         )[0]
@@ -251,8 +289,66 @@ class API(object):
         if not isinstance(instance, resource_class):
             raise ResourceMethodNotFoundError("'" + class_name + "' has no creation method '" + method_name + "'")
 
+        if methods is not None and len(methods) > 0:
+            result = self._call(
+                resource_class,
+                instance,
+                methods,
+                self.access_method_name,
+                environment,
+                tuple(method_type for method_type in allowed_method_types if method_type != 'create'),
+                encode=encode
+            )
 
+        commit = self._commit(name, instance, environment, encode=encode)
 
+        return {
+            'instance': instance,
+            'result': result,
+            'commit': commit
+        }
+
+    def read(self, name, methods, instance_args, environment, allowed_method_types=('read',), encode=True):
+        resource_class = self._get_resource(name)
+
+        # call the instance method and encode the result
+        result = self._call(
+            resource_class,
+            resource_class(**instance_args), # instantiate the resource
+            methods,
+            self.access_method_name,
+            environment,
+            allowed_method_types,
+            encode
+        )
+
+        return result
+
+    def update(self, name, methods, instance_args, environment, allowed_method_types=('read', 'update', 'delete'), encode=True):
+        resource_class = self._get_resource(name)
+
+        instance = resource_class(**instance_args)
+
+        # call the instance method and encode the result
+        result = self._call(
+            resource_class,
+            instance, # instantiate the resource
+            methods,
+            self.access_method_name,
+            environment,
+            allowed_method_types,
+            encode=encode
+        )
+                    
+        return {
+            'result': result,
+            'commit': self._commit(name, instance, environment, encode=encode)
+        }
+
+    def delete(self, name, method, instance_args, environment, allowed_method_types=('delete',), encode=True):
+        result = self.update(name, [method], instance_args, environment, allowed_method_types=allowed_method_types, encode=encode)
+        result['result'] = result['result'][0]
+        return result
 
 
 resource = API().resource
